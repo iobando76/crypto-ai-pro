@@ -1,0 +1,28 @@
+version: "3.9"
+services:
+  api:
+    build: .
+    container_name: crypto_api
+    command: uvicorn app.api.app:app --host ${API_HOST} --port ${API_PORT}
+    env_file: .env
+    volumes:
+      - ./:/workspace
+    ports:
+      - "${API_PORT}:${API_PORT}"
+  ui:
+    build: .
+    container_name: crypto_ui
+    command: streamlit run app/ui/app.py --server.address 0.0.0.0 --server.port ${UI_PORT}
+    env_file: .env
+    volumes:
+      - ./:/workspace
+    ports:
+      - "${UI_PORT}:${UI_PORT}"
+  bot:
+    build: .
+    container_name: crypto_bot
+    command: python -u app/utils/telegram_bot.py
+    env_file: .env
+    volumes:
+      - ./:/workspace
+    restart: unless-stopped

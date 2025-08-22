@@ -1,0 +1,817 @@
+===== FILE: .env.example =====
+# === Binance ===
+BINANCE_API_KEY=""
+BINANCE_API_SECRET=""
+BINANCE_TESTNET=true
+# === Telegram ===
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+# === General ===
+BASE_QUOTE=USDT
+PAIRS=BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT
+DB_URL=sqlite:///./trading.db
+TIMEZONE=America/Costa_Rica
+TRADING_START=06:00
+TRADING_END=22:00
+# === Risk ===
+RISK_PER_TRADE=0.0075
+DAILY_MAX_DRAWDOWN=0.025
+MAX_CONCURRENT_POSITIONS=2
+MIN_NOTIONAL_USD=10
+MIN_VOLUME_USD=200000
+MAX_POSITION_NOTIONAL=0.20
+# scanner
+VOLUME_SPIKE_MULTIPLIER=3.0
+PRICE_SPIKE_PCT=0.06
+MAX_ACCEPTABLE_SPREAD_PCT=0.015
+MAX_POSITION_NOTIONAL_VOLATILE=0.05
+# DCA
+DCA_ENABLED=true
+DCA_TOTAL_USDT=200
+DCA_SPLIT_BTC=0.5
+API_HOST=0.0.0.0
+API_PORT=8000
+UI_PORT=8501
+
+
+===== FILE: DEPLOY_STEP_BY_STEP.md =====
+Paso a paso para desplegar (resumen):
+1) Clona repo en VM
+2) Copia .env con keys (usar BINANCE_TESTNET=true primero)
+3) docker compose up -d --build
+4) validar endpoints /health y UI
+5) paper trading 7-14 días
+6) crear API keys reales y cambiar BINANCE_TESTNET=false
+
+
+===== FILE: Dockerfile =====
+FROM python:3.11-slim
+WORKDIR /workspace
+RUN pip install --no-cache-dir --upgrade pip
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000 8501
+CMD ["bash","-lc","uvicorn app.api.app:app --host 0.0.0.0 --port 8000 & streamlit run app/ui/app.py --server.address 0.0.0.0 --server.port 8501"]
+
+
+===== FILE: SECURE_README.md =====
+Security notes: store secrets in GitHub secrets or server env. Do not commit .env. Use SSH deploy keys and protect main branch.
+
+
+===== FILE: docker-compose.yml =====
+version: "3.9"
+services:
+  api:
+    build: .
+    container_name: crypto_api
+    command: uvicorn app.api.app:app --host ${API_HOST} --port ${API_PORT}
+    env_file: .env
+    volumes:
+      - ./:/workspace
+    ports:
+      - "${API_PORT}:${API_PORT}"
+  ui:
+    build: .
+    container_name: crypto_ui
+    command: streamlit run app/ui/app.py --server.address 0.0.0.0 --server.port ${UI_PORT}
+    env_file: .env
+    volumes:
+      - ./:/workspace
+    ports:
+      - "${UI_PORT}:${UI_PORT}"
+  bot:
+    build: .
+    container_name: crypto_bot
+    command: python -u app/utils/telegram_bot.py
+    env_file: .env
+    volumes:
+      - ./:/workspace
+    restart: unless-stopped
+
+
+===== FILE: requirements.txt =====
+python-dotenv
+ccxt
+pandas
+numpy
+pandas_ta
+SQLModel
+fastapi
+uvicorn[standard]
+APScheduler
+httpx
+streamlit
+python-telegram-bot==21.1.1
+structlog
+anyio
+
+
+===== FILE: app/config.py =====
+import os
+from dotenv import load_dotenv
+load_dotenv()
+def _bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).lower() in ("1","true","yes","y")
+class Settings:
+    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY","")
+    BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET","")
+    BINANCE_TESTNET = _bool("BINANCE_TESTNET", True)
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
+    BASE_QUOTE = os.getenv("BASE_QUOTE","USDT")
+    PAIRS = [p.strip() for p in os.getenv("PAIRS","BTC/USDT,ETH/USDT").split(",") if p.strip()]
+    DB_URL = os.getenv("DB_URL","sqlite:///./trading.db")
+    TIMEZONE = os.getenv("TIMEZONE","America/Costa_Rica")
+    TRADING_START = os.getenv("TRADING_START","06:00")
+    TRADING_END = os.getenv("TRADING_END","22:00")
+    RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE",0.0075))
+    DAILY_MAX_DRAWDOWN = float(os.getenv("DAILY_MAX_DRAWDOWN",0.025))
+    MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS",2))
+    MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD",10))
+    MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD",200000))
+    MAX_POSITION_NOTIONAL = float(os.getenv("MAX_POSITION_NOTIONAL",0.20))
+    VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER",3.0))
+    PRICE_SPIKE_PCT = float(os.getenv("PRICE_SPIKE_PCT",0.06))
+    MAX_ACCEPTABLE_SPREAD_PCT = float(os.getenv("MAX_ACCEPTABLE_SPREAD_PCT",0.015))
+    MAX_POSITION_NOTIONAL_VOLATILE = float(os.getenv("MAX_POSITION_NOTIONAL_VOLATILE",0.05))
+    LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS",300))
+    SIGNAL_INTERVAL_MINUTES = int(os.getenv("SIGNAL_INTERVAL_MINUTES",5))
+    API_HOST = os.getenv("API_HOST","0.0.0.0")
+    API_PORT = int(os.getenv("API_PORT",8000))
+    UI_PORT = int(os.getenv("UI_PORT",8501))
+settings = Settings()
+
+
+===== FILE: app/db.py =====
+from datetime import datetime, date
+from typing import Optional
+from sqlmodel import SQLModel, Field, create_engine, Session, select
+from .config import settings
+engine = create_engine(settings.DB_URL, echo=False)
+class Signal(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    symbol: str
+    side: str
+    entry: float
+    sl: float
+    tp: float
+    timeframe: str
+    rationale: str
+    status: str = "pending"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    type: str = "strategy"
+class Order(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    signal_id: int
+    exchange_order_id: Optional[str] = None
+    symbol: str
+    side: str
+    qty: float
+    entry: float
+    sl: float
+    tp: float
+    status: str = "submitted"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+class Position(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    symbol: str
+    side: str
+    qty: float
+    avg_entry: float
+    sl: float
+    tp: float
+    opened_at: datetime = Field(default_factory=datetime.utcnow)
+    status: str = "open"
+class EquitySnapshot(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    at: datetime = Field(default_factory=datetime.utcnow)
+    equity_usdt: float
+class ExecLock(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    day: date
+    locked: bool = False
+def init_db():
+    SQLModel.metadata.create_all(engine)
+def get_session():
+    return Session(engine)
+
+
+===== FILE: app/state.py =====
+from dataclasses import dataclass
+@dataclass
+class RuntimeState:
+    equity_usdt: float = 300.0
+state = RuntimeState()
+
+
+===== FILE: app/utils/logger.py =====
+import structlog
+structlog.configure(processors=[structlog.processors.TimeStamper(fmt='iso'), structlog.processors.add_log_level, structlog.processors.JSONRenderer()])
+logger = structlog.get_logger()
+
+
+===== FILE: app/utils/telegram.py =====
+import httpx
+from ..config import settings
+async def send_telegram_message(text: str):
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        return None
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = { "chat_id": settings.TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML" }
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, data=payload)
+        return r.json()
+
+
+===== FILE: app/utils/telegram_bot.py =====
+import os, requests, logging
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from ..config import settings
+API_URL = os.getenv('API_URL', f"http://{settings.API_HOST}:{settings.API_PORT}")
+CHAT_ID = settings.TELEGRAM_CHAT_ID
+logging.basicConfig(level=logging.INFO)
+async def send_signal_card(signal_id: int, symbol: str, entry: float, sl: float, tp: float, rationale: str):
+    text = f"🔔 Señal #{signal_id}\n{symbol} BUY\nEntry: {entry:.4f}\nSL: {sl:.4f} TP: {tp:.4f}\n{rationale}"
+    keyboard = [[InlineKeyboardButton("✅ Aprobar", callback_data=f"approve:{signal_id}"), InlineKeyboardButton("❌ Rechazar", callback_data=f"reject:{signal_id}")]]
+    app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
+    await app.bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await app.shutdown()
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if str(user_id) != str(CHAT_ID):
+        await query.edit_message_text("Acción no permitida.")
+        return
+    action, sid = query.data.split(":")
+    sid = int(sid)
+    if action == 'approve':
+        try:
+            r = requests.post(f"{API_URL}/signals/{sid}/approve", timeout=15)
+            await query.edit_message_text(f"✅ Señal {sid} aprobada.")
+        except Exception as e:
+            await query.edit_message_text(f"Error aprobando señal: {e}")
+    else:
+        try:
+            r = requests.post(f"{API_URL}/signals/{sid}/reject", timeout=15)
+            await query.edit_message_text(f"❌ Señal {sid} rechazada.")
+        except Exception as e:
+            await query.edit_message_text(f"Error rechazando señal: {e}")
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(CHAT_ID):
+        await update.message.reply_text("No autorizado")
+        return
+    try:
+        r = requests.get(f"{API_URL}/account", timeout=10)
+        await update.message.reply_text(str(r.json()))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+def run_bot():
+    app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CallbackQueryHandler(callback_query_handler))
+    app.add_handler(CommandHandler('status', cmd_status))
+    app.run_polling()
+if __name__ == '__main__':
+    run_bot()
+
+
+===== FILE: app/utils/timebox.py =====
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+from ..config import settings
+TZ = ZoneInfo(settings.TIMEZONE)
+def in_trading_window(now: datetime | None = None) -> bool:
+    now = now or datetime.now(TZ)
+    start_h, start_m = map(int, settings.TRADING_START.split(':'))
+    end_h, end_m = map(int, settings.TRADING_END.split(':'))
+    start = time(hour=start_h, minute=start_m, tzinfo=TZ)
+    end = time(hour=end_h, minute=end_m, tzinfo=TZ)
+    return start <= now.timetz() <= end
+def local_now() -> datetime:
+    return datetime.now(TZ)
+
+
+===== FILE: app/data/feed.py =====
+import ccxt, pandas as pd
+from ..config import settings
+class DataFeed:
+    def __init__(self):
+        args = {'enableRateLimit': True, 'options': {'defaultType': 'spot'}}
+        if settings.BINANCE_API_KEY:
+            args.update({'apiKey': settings.BINANCE_API_KEY, 'secret': settings.BINANCE_API_SECRET})
+        self.ex = ccxt.binance(args)
+        if settings.BINANCE_TESTNET:
+            try:
+                self.ex.set_sandbox_mode(True)
+            except Exception:
+                pass
+    def ohlcv(self, symbol: str, timeframe: str = '5m', limit: int = 500):
+        data = self.ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(data, columns=['ts','open','high','low','close','volume'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+        df.set_index('ts', inplace=True)
+        return df
+    def last_price(self, symbol: str):
+        return float(self.ex.fetch_ticker(symbol)['last'])
+    def equity_usdt(self) -> float:
+        try:
+            balances = self.ex.fetch_balance()
+            total_usdt = balances['total'].get('USDT', 0.0)
+            for coin in ('BTC','ETH','SOL','XRP'):
+                qty = balances['total'].get(coin, 0.0)
+                if qty:
+                    price = self.last_price(f"{coin}/USDT")
+                    total_usdt += qty * price
+            return float(total_usdt)
+        except Exception:
+            return 0.0
+
+
+===== FILE: app/data/markets.py =====
+import ccxt
+from ..config import settings
+class Markets:
+    def __init__(self):
+        params = {'enableRateLimit': True, 'options': {'defaultType': 'spot'}}
+        if settings.BINANCE_API_KEY:
+            params.update({'apiKey': settings.BINANCE_API_KEY, 'secret': settings.BINANCE_API_SECRET})
+        self.ex = ccxt.binance(params)
+        if settings.BINANCE_TESTNET:
+            try:
+                self.ex.set_sandbox_mode(True)
+            except Exception:
+                pass
+        self.markets = self.ex.load_markets()
+    def amount_to_precision(self, symbol: str, amount: float) -> float:
+        try:
+            return float(self.ex.amount_to_precision(symbol, amount))
+        except Exception:
+            return amount
+    def price_to_precision(self, symbol: str, price: float) -> float:
+        try:
+            return float(self.ex.price_to_precision(symbol, price))
+        except Exception:
+            return price
+
+
+===== FILE: app/engine/indicators.py =====
+import pandas as pd
+import pandas_ta as ta
+def add_base_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df['ema20'] = ta.ema(df['close'], length=20)
+    df['ema50'] = ta.ema(df['close'], length=50)
+    adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+    df['adx'] = adx['ADX_14']
+    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    bb = ta.bbands(df['close'], length=20, std=2)
+    df['bb_low'] = bb['BBL_20_2.0']
+    df['bb_mid'] = bb['BBM_20_2.0']
+    df['bb_high'] = bb['BBU_20_2.0']
+    df['rsi'] = ta.rsi(df['close'], length=14)
+    return df
+
+
+===== FILE: app/engine/manager.py =====
+from time import sleep
+from sqlmodel import select
+from ..config import settings
+from ..db import get_session, EquitySnapshot, ExecLock
+from ..utils.logger import logger
+def _daily_dd_locked() -> bool:
+    with get_session() as s:
+        snaps = s.exec(select(EquitySnapshot).order_by(EquitySnapshot.at)).all()
+        if not snaps:
+            return False
+        today = snaps[-1].at.date()
+        today_snaps = [x for x in snaps if x.at.date() == today]
+        if len(today_snaps) < 2:
+            return False
+        start_eq = today_snaps[0].equity_usdt
+        current_eq = today_snaps[-1].equity_usdt
+        dd = (start_eq - current_eq) / start_eq if start_eq > 0 else 0.0
+        if dd >= settings.DAILY_MAX_DRAWDOWN:
+            lock = s.exec(select(ExecLock).where(ExecLock.day == today)).first()
+            if not lock:
+                lock = ExecLock(day=today, locked=True)
+                s.add(lock)
+            else:
+                lock.locked = True
+            s.commit()
+            logger.warning("lock_triggered", drawdown=dd)
+            return True
+    return False
+def run_manager_loop():
+    while True:
+        try:
+            if _daily_dd_locked():
+                sleep(20)
+                continue
+        except Exception as e:
+            logger.error("manager_error", error=str(e))
+        sleep(20)
+
+
+===== FILE: app/engine/risk.py =====
+from dataclasses import dataclass
+@dataclass
+class RiskConfig:
+    equity_usdt: float
+    risk_per_trade: float
+    daily_max_drawdown: float
+    max_concurrent_positions: int
+def position_size(entry: float, sl: float, equity_usdt: float, risk_frac: float) -> float:
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0:
+        return 0.0
+    risk_usd = equity_usdt * risk_frac
+    qty = risk_usd / sl_dist
+    return max(qty, 0.0)
+def dynamic_position_size(entry: float, sl: float, equity_usdt: float, base_risk_frac: float, atr: float = None, max_notional_frac: float = 0.2) -> float:
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0 or equity_usdt <= 0:
+        return 0.0
+    vol_scale = 1.0
+    if atr and atr > 0:
+        ratio = (entry / atr)
+        vol_scale = max(0.5, min(2.0, ratio / 500.0))
+    risk_usd = equity_usdt * base_risk_frac * vol_scale
+    qty = risk_usd / sl_dist
+    max_notional = equity_usdt * max_notional_frac
+    notional = qty * entry
+    if notional > max_notional:
+        qty = max_notional / entry
+    return max(qty, 0.0)
+
+
+===== FILE: app/engine/scheduler.py =====
+from datetime import datetime
+from apscheduler.schedulers.background import BackgroundScheduler
+from sqlmodel import select
+from ..config import settings
+from ..data.feed import DataFeed
+from ..engine.strategies import breakout_strategy, mean_reversion_strategy, quick_momentum_strategy
+from ..engine.scanner import detect_volatile_opportunity
+from ..db import get_session, Signal as DBSig, EquitySnapshot, ExecLock
+from ..utils.logger import logger
+from ..utils.timebox import in_trading_window, local_now
+feed = DataFeed()
+scheduler = BackgroundScheduler(timezone=settings.TIMEZONE)
+def _snapshot_equity():
+    try:
+        eq = feed.equity_usdt()
+    except Exception as e:
+        logger.error("equity_read_error", error=str(e))
+        return
+    with get_session() as s:
+        s.add(EquitySnapshot(equity_usdt=eq))
+        s.commit()
+def _reset_daily():
+    with get_session() as s:
+        today = local_now().date()
+        q = select(ExecLock).where(ExecLock.day == today)
+        lock = s.exec(q).first()
+        if not lock:
+            lock = ExecLock(day=today, locked=False)
+            s.add(lock)
+        s.commit()
+def generate_signals():
+    if not in_trading_window():
+        logger.info("skip_signals_outside_window")
+        return
+    with get_session() as s:
+        today = local_now().date()
+        lock = s.exec(select(ExecLock).where(ExecLock.day == today)).first()
+        if lock and lock.locked:
+            logger.info("skip_signals_locked")
+            return
+    for symbol in settings.PAIRS:
+        try:
+            df = feed.ohlcv(symbol, timeframe='5m', limit=settings.LOOKBACK_BARS)
+            last_n = min(len(df), 288)
+            vol_sum = df['volume'].iloc[-last_n:].sum()
+            last_price = float(df['close'].iloc[-1])
+            notional_24h = vol_sum * last_price
+            if notional_24h < settings.MIN_VOLUME_USD:
+                logger.info("skip_pair_low_volume", symbol=symbol, notional_24h=notional_24h)
+                continue
+            sigs = []
+            sigs += breakout_strategy(df, symbol, '5m')
+            sigs += mean_reversion_strategy(df, symbol, '5m')
+            try:
+                sigs += quick_momentum_strategy(df, symbol, '5m')
+            except Exception:
+                pass
+            with get_session() as s:
+                for sig in sigs:
+                    s.add(DBSig(symbol=sig.symbol, side=sig.side, entry=sig.entry, sl=sig.sl, tp=sig.tp, timeframe=sig.timeframe, rationale=sig.rationale, type='strategy'))
+                s.commit()
+        except Exception as e:
+            logger.error("signal_error", symbol=symbol, error=str(e))
+def start_scheduler():
+    scheduler.add_job(_snapshot_equity, 'interval', minutes=15)
+    scheduler.add_job(_reset_daily, 'cron', hour=0, minute=1)
+    scheduler.add_job(generate_signals, 'interval', minutes=settings.SIGNAL_INTERVAL_MINUTES)
+    scheduler.add_job(lambda: [detect_volatile_opportunity(sym) for sym in settings.PAIRS], 'interval', minutes=1)
+    scheduler.start()
+
+
+===== FILE: app/engine/strategies.py =====
+from typing import List
+import pandas as pd
+from .indicators import add_base_indicators
+class Signal:
+    def __init__(self, symbol: str, side: str, entry: float, sl: float, tp: float, timeframe: str, rationale: str, typ: str = "strategy"):
+        self.symbol = symbol
+        self.side = side
+        self.entry = entry
+        self.sl = sl
+        self.tp = tp
+        self.timeframe = timeframe
+        self.rationale = rationale
+        self.type = typ
+def breakout_strategy(df: pd.DataFrame, symbol: str, timeframe: str = '5m') -> List[Signal]:
+    df = add_base_indicators(df)
+    if len(df) < 100:
+        return []
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    if not (last['ema20'] > last['ema50'] and last['adx'] > 20):
+        return []
+    N = 20
+    trigger = df['high'].iloc[-N:].max()
+    if last['close'] > trigger and prev['close'] <= trigger:
+        atr = float(last['atr'])
+        entry = float(last['close'])
+        sl = entry - 1.5 * atr
+        tp = entry + 2.0 * (entry - sl)
+        return [Signal(symbol, 'buy', entry, sl, tp, timeframe, f"Breakout EMA20>EMA50 ADX>20 ATR={atr:.2f}")]
+    return []
+def mean_reversion_strategy(df: pd.DataFrame, symbol: str, timeframe: str = '5m') -> List[Signal]:
+    df = add_base_indicators(df)
+    if len(df) < 100:
+        return []
+    last = df.iloc[-1]
+    in_range = (abs(last['ema20'] - last['ema50']) / last['close'] < 0.005) and (last['adx'] < 18)
+    if not in_range:
+        return []
+    if last['close'] <= last['bb_low'] and last['rsi'] < 30:
+        atr = float(last['atr'])
+        entry = float(last['close'])
+        sl = entry - 1.2 * atr
+        tp = float(last['bb_mid'])
+        if tp > entry:
+            return [Signal(symbol, 'buy', entry, sl, tp, timeframe, f"MR banda baja + RSI ATR={atr:.2f}")]
+    return []
+def quick_momentum_strategy(df: pd.DataFrame, symbol: str, timeframe: str = '5m'):
+    df = add_base_indicators(df)
+    if len(df) < 50:
+        return []
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    cond_trend = last['ema20'] > last['ema50']
+    price_jump = (last['close'] - prev['close']) / prev['close'] > 0.03
+    if cond_trend and price_jump and last['rsi'] < 85:
+        atr = float(last['atr'])
+        entry = float(last['close'])
+        sl = entry - 1.0 * atr
+        tp = entry + 1.5 * (entry - sl)
+        return [Signal(symbol, 'buy', entry, sl, tp, timeframe, f"Quick momentum EMA trend + jump ATR={atr:.3f}")]
+    return []
+
+
+===== FILE: app/broker/binance.py =====
+import ccxt
+from ..config import settings
+from ..data.markets import Markets
+from ..utils.logger import logger
+class BinanceExec:
+    def __init__(self):
+        params = {'enableRateLimit': True, 'options': {'defaultType': 'spot'}}
+        if settings.BINANCE_API_KEY:
+            params.update({'apiKey': settings.BINANCE_API_KEY, 'secret': settings.BINANCE_API_SECRET})
+        self.ex = ccxt.binance(params)
+        if settings.BINANCE_TESTNET:
+            try:
+                self.ex.set_sandbox_mode(True)
+            except Exception:
+                pass
+        self.mk = Markets()
+    def place_bracket_market(self, symbol: str, side: str, qty: float, entry_price: float, tp: float, sl: float) -> dict:
+        qty = self.mk.amount_to_precision(symbol, qty)
+        logger.info("place_bracket_market", symbol=symbol, side=side, qty=qty, entry=entry_price, tp=tp, sl=sl)
+        order = self.ex.create_order(symbol=symbol, type='market', side=side, amount=qty)
+        opp_side = 'sell' if side == 'buy' else 'buy'
+        try:
+            self.ex.create_order(symbol=symbol, type='limit', side=opp_side, amount=qty, price=self.mk.price_to_precision(symbol, tp), params={'timeInForce':'GTC'})
+        except Exception:
+            pass
+        try:
+            self.ex.create_order(symbol=symbol, type='stop_loss_limit', side=opp_side, amount=qty, price=self.mk.price_to_precision(symbol, sl), params={'stopPrice':self.mk.price_to_precision(symbol, sl),'timeInForce':'GTC'})
+        except Exception:
+            pass
+        return order
+
+
+===== FILE: app/broker/paper.py =====
+from dataclasses import dataclass
+@dataclass
+class PaperOrder:
+    symbol: str
+    side: str
+    qty: float
+    entry: float
+    tp: float
+    sl: float
+class PaperBroker:
+    def place_bracket_market(self, symbol: str, side: str, qty: float, entry: float, tp: float, sl: float):
+        return {"paper": True, "symbol": symbol, "side": side, "qty": qty, "entry": entry, "tp": tp, "sl": sl}
+
+
+===== FILE: app/api/app.py =====
+from fastapi import FastAPI, HTTPException
+from sqlmodel import select
+from ..db import init_db, get_session, Signal as DBSig, Order
+from ..config import settings
+from ..engine.risk import position_size
+from ..data.feed import DataFeed
+from ..data.markets import Markets
+from ..utils.telegram import send_telegram_message
+from ..utils.timebox import in_trading_window
+from ..utils.logger import logger
+from ..engine.scheduler import start_scheduler
+from ..state import state
+app = FastAPI(title="Crypto Assistant API")
+init_db()
+start_scheduler()
+feed = DataFeed()
+mk = Markets()
+try:
+    if settings.BINANCE_TESTNET:
+        from ..broker.paper import PaperBroker
+        broker = PaperBroker()
+    else:
+        from ..broker.binance import BinanceExec
+        broker = BinanceExec()
+except Exception as e:
+    logger.error("broker_init_error", error=str(e))
+@app.get('/health')
+def health():
+    return {"ok": True}
+@app.get('/account')
+def account():
+    eq = feed.equity_usdt()
+    state.equity_usdt = eq
+    return {"equity_usdt": eq, "pairs": settings.PAIRS}
+@app.get('/signals')
+def list_signals(status: str = 'pending'):
+    with get_session() as s:
+        rows = s.exec(select(DBSig).where(DBSig.status == status).order_by(DBSig.id.desc())).all()
+        return [r.dict() for r in rows]
+@app.post('/signals/{signal_id}/approve')
+def approve_signal(signal_id: int, qty: float | None = None):
+    if not in_trading_window():
+        raise HTTPException(400, 'Fuera de la ventana operativa')
+    with get_session() as s:
+        sig = s.get(DBSig, signal_id)
+        if not sig or sig.status != 'pending':
+            raise HTTPException(404, 'Signal no encontrada o no pendiente')
+        eq = feed.equity_usdt()
+        state.equity_usdt = eq
+        if qty is None:
+            try:
+                from ..engine.risk import dynamic_position_size
+                df_tmp = feed.ohlcv(sig.symbol, timeframe='5m', limit=50)
+                atr = float(df_tmp['atr'].iloc[-1]) if 'atr' in df_tmp.columns else None
+                max_frac = settings.MAX_POSITION_NOTIONAL_VOLATILE if sig.timeframe == 'volatile' else settings.MAX_POSITION_NOTIONAL
+                qty = dynamic_position_size(entry=sig.entry, sl=sig.sl, equity_usdt=eq, base_risk_frac=settings.RISK_PER_TRADE, atr=atr, max_notional_frac=max_frac)
+            except Exception:
+                qty = position_size(entry=sig.entry, sl=sig.sl, equity_usdt=eq, risk_frac=settings.RISK_PER_TRADE)
+            try:
+                qty = mk.amount_to_precision(sig.symbol, qty)
+            except Exception:
+                pass
+        notional = qty * sig.entry
+        cap_notional = eq * settings.MAX_POSITION_NOTIONAL
+        if notional > cap_notional and sig.entry > 0:
+            qty = mk.amount_to_precision(sig.symbol, cap_notional / sig.entry)
+        order_res = broker.place_bracket_market(symbol=sig.symbol, side=sig.side, qty=qty, entry_price=sig.entry, tp=sig.tp, sl=sig.sl)
+        sig.status = 'approved'
+        order = Order(signal_id=sig.id, symbol=sig.symbol, side=sig.side, qty=qty, entry=sig.entry, sl=sig.sl, tp=sig.tp)
+        s.add(order)
+        s.add(sig)
+        s.commit()
+    msg = f"✅ <b>Orden aprobada</b>\n{sig.symbol} {sig.side.upper()} qty={qty}\nEntry={sig.entry:.4f} SL={sig.sl:.4f} TP={sig.tp:.4f}"
+    try:
+        import anyio
+        anyio.run(send_telegram_message, msg)
+    except Exception:
+        pass
+    return {"ok": True, "qty": qty}
+@app.post('/signals/{signal_id}/reject')
+def reject_signal(signal_id: int):
+    with get_session() as s:
+        sig = s.get(DBSig, signal_id)
+        if not sig or sig.status != 'pending':
+            raise HTTPException(404, 'Signal no encontrada o no pendiente')
+        sig.status = 'rejected'
+        s.add(sig)
+        s.commit()
+    return {"ok": True}
+
+
+===== FILE: app/api/schemas.py =====
+from pydantic import BaseModel
+class ApproveOrder(BaseModel):
+    signal_id: int
+    qty: float | None = None
+
+
+===== FILE: app/ui/app.py =====
+import time, requests, pandas as pd, streamlit as st
+from os import getenv
+API_URL = getenv('API_URL', 'http://localhost:8000')
+st.set_page_config(page_title='Crypto Assistant – PRO', layout='wide')
+st.title('Crypto Assistant – PRO')
+colA, colB = st.columns([2,2])
+with colA:
+    st.subheader('Cuenta')
+    try:
+        acc = requests.get(f"{API_URL}/account", timeout=10).json()
+        st.metric('Equity (USDT)', f"{acc['equity_usdt']:.2f}")
+    except Exception as e:
+        st.error(f'No se pudo leer cuenta: {e}')
+with colB:
+    st.subheader('Señales pendientes')
+    try:
+        sigs = requests.get(f"{API_URL}/signals?status=pending", timeout=10).json()
+        df = pd.DataFrame(sigs) if sigs else pd.DataFrame()
+        st.dataframe(df, use_container_width=True)
+    except Exception as e:
+        st.error(f'Error obteniendo señales: {e}')
+st.subheader('Aprobación manual')
+signal_id = st.number_input('ID de la señal', min_value=1, step=1)
+qty = st.text_input('Cantidad (opcional)')
+if st.button('Aprobar'):
+    try:
+        params = {}
+        if qty.strip(): params['qty'] = float(qty)
+        r = requests.post(f"{API_URL}/signals/{int(signal_id)}/approve", params=params, timeout=20)
+        st.success(r.json())
+        time.sleep(1)
+        st.experimental_rerun()
+    except Exception as e:
+        st.error(str(e))
+if st.button('Rechazar'):
+    try:
+        r = requests.post(f"{API_URL}/signals/{int(signal_id)}/reject", timeout=20)
+        st.warning(r.json())
+        time.sleep(1)
+        st.experimental_rerun()
+    except Exception as e:
+        st.error(str(e))
+
+
+===== FILE: scripts/backup_db.sh =====
+#!/usr/bin/env bash
+DB_PATH="${1:-./trading.db}"
+DEST_DIR="${2:-./backups}"
+mkdir -p "$DEST_DIR"
+cp "$DB_PATH" "$DEST_DIR/trading.$(date +%F_%H%M%S).db"
+echo "Backup done"
+
+
+===== FILE: .github/workflows/ci-cd.yml =====
+name: CI/CD
+on:
+  push:
+    branches: [ main ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: pytest -q || true
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.1
+        with:
+          ssh-private-key: ${{ secrets.SSH_DEPLOY_KEY }}
+      - name: Deploy via SSH
+        run: ssh -o StrictHostKeyChecking=no -p ${{ secrets.SSH_DEPLOY_PORT }} ${{ secrets.SSH_DEPLOY_USER }}@${{ secrets.SSH_DEPLOY_HOST }} 'cd ~/crypto-assistant && git pull origin main && docker compose up -d --build'
+
+

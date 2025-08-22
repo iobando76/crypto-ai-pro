@@ -1,0 +1,33 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+def _bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).lower() in ("1","true","yes","y")
+class Settings:
+    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY","")
+    BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET","")
+    BINANCE_TESTNET = _bool("BINANCE_TESTNET", True)
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
+    BASE_QUOTE = os.getenv("BASE_QUOTE","USDT")
+    PAIRS = [p.strip() for p in os.getenv("PAIRS","BTC/USDT,ETH/USDT").split(",") if p.strip()]
+    DB_URL = os.getenv("DB_URL","sqlite:///./trading.db")
+    TIMEZONE = os.getenv("TIMEZONE","America/Costa_Rica")
+    TRADING_START = os.getenv("TRADING_START","06:00")
+    TRADING_END = os.getenv("TRADING_END","22:00")
+    RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE",0.0075))
+    DAILY_MAX_DRAWDOWN = float(os.getenv("DAILY_MAX_DRAWDOWN",0.025))
+    MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS",2))
+    MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD",10))
+    MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD",200000))
+    MAX_POSITION_NOTIONAL = float(os.getenv("MAX_POSITION_NOTIONAL",0.20))
+    VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER",3.0))
+    PRICE_SPIKE_PCT = float(os.getenv("PRICE_SPIKE_PCT",0.06))
+    MAX_ACCEPTABLE_SPREAD_PCT = float(os.getenv("MAX_ACCEPTABLE_SPREAD_PCT",0.015))
+    MAX_POSITION_NOTIONAL_VOLATILE = float(os.getenv("MAX_POSITION_NOTIONAL_VOLATILE",0.05))
+    LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS",300))
+    SIGNAL_INTERVAL_MINUTES = int(os.getenv("SIGNAL_INTERVAL_MINUTES",5))
+    API_HOST = os.getenv("API_HOST","0.0.0.0")
+    API_PORT = int(os.getenv("API_PORT",8000))
+    UI_PORT = int(os.getenv("UI_PORT",8501))
+settings = Settings()

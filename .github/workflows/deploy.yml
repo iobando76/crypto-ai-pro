@@ -1,0 +1,44 @@
+name: Deploy Crypto AI Pro
+
+on:
+  push:
+    branches:
+      - main   # Se ejecuta cuando haces push a master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v3
+
+      - name: Configurar acceso SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ORACLE_SSH_KEY }}
+
+      - name: Copiar archivos al servidor
+        run: |
+          ssh -o StrictHostKeyChecking=no ubuntu@163.192.15.187 "mkdir -p ~/crypto-ai-pro"
+          rsync -avz --exclude '.git*' --exclude 'deploy.sh' ./ ubuntu@163.192.15.187:~/crypto-ai-pro/
+
+      - name: Instalar dependencias y desplegar
+        run: |
+          ssh -o StrictHostKeyChecking=no ubuntu@163.192.15.187 << 'EOF'
+          cd ~/crypto-ai-pro
+
+          # Crear entorno virtual si no existe
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+          fi
+
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+          # Reiniciar servicio del bot
+          sudo systemctl daemon-reload
+          sudo systemctl enable crypto-ai-bot
+          sudo systemctl restart crypto-ai-bot
+          EOF

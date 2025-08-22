@@ -1,0 +1,14 @@
+python-dotenv
+ccxt
+pandas
+numpy
+pandas_ta
+SQLModel
+fastapi
+uvicorn[standard]
+APScheduler
+httpx
+streamlit
+python-telegram-bot==21.1.1
+structlog
+anyio

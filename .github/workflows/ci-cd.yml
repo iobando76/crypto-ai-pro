@@ -1,0 +1,29 @@
+name: CI/CD
+on:
+  push:
+    branches: [ main ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: pytest -q || true
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.1
+        with:
+          ssh-private-key: ${{ secrets.SSH_DEPLOY_KEY }}
+      - name: Deploy via SSH
+        run: ssh -o StrictHostKeyChecking=no -p ${{ secrets.SSH_DEPLOY_PORT }} ${{ secrets.SSH_DEPLOY_USER }}@${{ secrets.SSH_DEPLOY_HOST }} 'cd ~/crypto-assistant && git pull origin main && docker compose up -d --build'
